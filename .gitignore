@@ -4,5 +4,4 @@
 hls_output/
 mp4decrypt
 output/
-run.sh
 *.wvd
