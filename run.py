@@ -92,9 +92,6 @@ def split_date_from_title(raw_title):
     """
     Extract a day-first date (d/mm/YYYY or dd-mm-YYYY) from an <h1> string.
     Returns (YYYY-mm-dd, cleaned_title), or (None, cleaned_title) if no valid date is found.
-
-    "Educational Class 4/09/2026" -> ("2026-09-04", "Educational Class")
-    "PTA - 02-11-2026"            -> ("2026-11-02", "PTA")
     """
     if not raw_title:
         return None, None
@@ -289,6 +286,121 @@ def extract_pssh(video_manifest: str) -> str:
     return pssh_b64
 
 
+########################################################################################################
+############# SCRAPE LIVESTREAMS #######################################################################
+########################################################################################################
+
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+# Matches href="/members/live/<uuid>" (single quotes are accepted as well).
+_MEMBER_LINK_RE = re.compile(rf"""href=(["'])/members/live/({_UUID})\1""")
+
+
+def extract_member_uuids(html: str) -> list[str]:
+    """Return the unique UUIDs found in /members/live/<uuid> links.
+
+    Results keep the order in which they first appear in the HTML.
+    Duplicates (compared case-insensitively) are removed.
+    """
+    uuids: list[str] = []
+    seen: set[str] = set()
+
+    for match in _MEMBER_LINK_RE.finditer(html):
+        uuid = match.group(2)
+        key = uuid.lower()
+        if key not in seen:
+            seen.add(key)
+            uuids.append(uuid)
+
+    return uuids
+
+
+async def render_page(
+    url: str,
+    session: str,
+    cookie_name: str = ZXOLCR() + "session",
+    *,
+    wait_selector: str = "section",
+    headless: bool = True,
+    navigation_timeout_ms: int = 60_000,
+    selector_timeout_ms: int = 30_000,
+) -> str:
+    """Render a page in headless Chromium and return the final HTML.
+
+    The session value is injected as a cookie before the page is loaded.
+    Pass the full cookie name via `cookie_name`, for example
+    `ZXOLCR() + "session"`.
+    """
+    parsed_url = urlparse(url)
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=headless)
+
+        try:
+            context = await browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+            )
+
+            # Inject the session cookie before loading the page.
+            await context.add_cookies(
+                [
+                    {
+                        "name": cookie_name,
+                        "value": session,
+                        "domain": parsed_url.hostname,
+                        "path": "/",
+                        "secure": parsed_url.scheme == "https",
+                        "httpOnly": True,
+                        "sameSite": "Lax",
+                    }
+                ]
+            )
+
+            page = await context.new_page()
+
+            logger.info("Rendering: %s", url)
+            logger.info("Injected session cookie")
+
+            await page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=navigation_timeout_ms,
+            )
+
+            try:
+                await page.wait_for_selector(
+                    wait_selector,
+                    timeout=selector_timeout_ms,
+                )
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    "Selector %r not found; waiting a fixed interval instead",
+                    wait_selector,
+                )
+                await page.wait_for_timeout(5_000)
+
+            # Short grace period for late client-side rendering.
+            await page.wait_for_timeout(1_000)
+
+            return await page.content()
+        finally:
+            await browser.close()
+
+
+async def scrape_member_uuids(
+    url: str,
+    session: str,
+    cookie_name: str = "session",
+) -> list[str]:
+    """Render the page and return the member UUIDs found in its links."""
+    html = await render_page(url, session, cookie_name)
+    return extract_member_uuids(html)
+
+
+########################################################################################################
+############# SCRAPE SINGLE MENTORSHIP #################################################################
+########################################################################################################
+
 async def render_page(args):
     """
     Render the supplied webpage with the session cookie
@@ -401,8 +513,8 @@ async def render_page(args):
             print(f"[+] Title    : {title}")
 
         elif "/live" in page_url or "/analysis" in page_url:
-            # live:     "Educational Class 4/09/2026" -> "2026-09-04 - Educational Class"
-            # analysis: "PTA - 02-11-2026"            -> "2026-11-02 - PTA"
+            # live:     "(*) 4/09/2026" -> "2026-09-04 - (*)"
+            # analysis: "(*) - 02-11-2026"            -> "2026-11-02 - (*)"
             date, title = split_date_from_title(title)
 
             # Live only: if the <h1> has no date, fall back to the <p> next to it
