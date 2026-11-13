@@ -12,7 +12,9 @@ import os
 import zipfile
 import urllib.request
 import tempfile
+import logging
 
+from enum import Enum
 from typing import Union
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -23,6 +25,12 @@ from pywidevine.device import Device
 from pywidevine.pssh import PSSH
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from yt_dlp import YoutubeDL
+
+logger = logging.getLogger(__name__)
+
+_A = 'B^^ZY\x10\x05\x05^I^\x07^XKNCDM\x04IEG\x05GOGHOXY\x05KDKFSYCY\x15[\x17\x0cGED^B\x17KFF'
+_L = 'B^^ZY\x10\x05\x05^I^\x07^XKNCDM\x04IEG\x05GOGHOXY\x05FC\\O'
+_C = 'B^^ZY\x10\x05\x05^I^\x07^XKNCDM\x04IEG\x05GOGHOXY\x05IE_XYOY'
 
 HLS_OUTPUT_DIR = Path("hls_output")
 OUTPUT_DIR = Path("output")
@@ -286,60 +294,91 @@ def extract_pssh(video_manifest: str) -> str:
     return pssh_b64
 
 
+
 ########################################################################################################
-############# SCRAPE LIVESTREAMS #######################################################################
+############# SCRAPE CONSTANTS
 ########################################################################################################
+
+class LinkType(str, Enum):
+    LIVE = "live"
+    ANALYSIS = "analysis"
+    LESSONS = "lessons"
+
 
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 
-# Matches href="/members/live/<uuid>" (single quotes are accepted as well).
-_MEMBER_LINK_RE = re.compile(rf"""href=(["'])/members/live/({_UUID})\1""")
+# Any single path segment (no quotes, slashes, query string, fragment or whitespace).
+_SEGMENT = r'''[^"'/?#\s]+'''
+
+# ID format per link type. Tighten these if analysis/lessons IDs have a known format.
+_ID_PATTERNS: dict[LinkType, str] = {
+    LinkType.LIVE: _UUID,
+    LinkType.ANALYSIS: _UUID,
+    LinkType.LESSONS: _SEGMENT,
+}
+
+_ID_URLS: dict[LinkType, str] = {
+    LinkType.LIVE: EHL_YIK_O(_L),
+    LinkType.ANALYSIS: EHL_YIK_O(_A),
+    LinkType.LESSONS: EHL_YIK_O(_C),
+}
+
+########################################################################################################
+############# SCRAPE
+########################################################################################################
+
+def _build_link_re(link_type: LinkType) -> re.Pattern[str]:
+    """Build the regex for href="/members/<link_type>/<id>" (single quotes also accepted)."""
+    id_pattern = _ID_PATTERNS[link_type]
+    return re.compile(
+        rf"""href=(["'])/members/{link_type.value}/({id_pattern})\1"""
+    )
 
 
-def extract_member_uuids(html: str) -> list[str]:
-    """Return the unique UUIDs found in /members/live/<uuid> links.
+def extract_member_ids(html: str, link_type: LinkType | str) -> list[str]:
+    """Return the unique IDs found in /members/<link_type>/<id> links.
 
     Results keep the order in which they first appear in the HTML.
     Duplicates (compared case-insensitively) are removed.
     """
-    uuids: list[str] = []
+    link_type = LinkType(link_type)
+    ids: list[str] = []
     seen: set[str] = set()
 
-    for match in _MEMBER_LINK_RE.finditer(html):
-        uuid = match.group(2)
-        key = uuid.lower()
+    link_re = _build_link_re(link_type)
+
+    logger.info(link_re)
+
+    for match in link_re.finditer(html):
+        value = match.group(2)
+        key = value.lower()
         if key not in seen:
             seen.add(key)
-            uuids.append(uuid)
+            ids.append(value)
 
-    return uuids
+    return ids
 
 
-async def render_page(
+async def fetch_rendered_html(
     url: str,
     session: str,
-    cookie_name: str = ZXOLCR() + "session",
-    *,
-    wait_selector: str = "section",
-    headless: bool = True,
-    navigation_timeout_ms: int = 60_000,
-    selector_timeout_ms: int = 30_000,
+    cookie_name: str,
 ) -> str:
     """Render a page in headless Chromium and return the final HTML.
 
     The session value is injected as a cookie before the page is loaded.
-    Pass the full cookie name via `cookie_name`, for example
-    `ZXOLCR() + "session"`.
     """
     parsed_url = urlparse(url)
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=headless)
+        browser = await playwright.chromium.launch(headless=True)
 
         try:
             context = await browser.new_context(
                 viewport={"width": 1920, "height": 1080},
             )
+
+            logger.info(f"cookie: {cookie_name}")
 
             # Inject the session cookie before loading the page.
             await context.add_cookies(
@@ -364,18 +403,18 @@ async def render_page(
             await page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=navigation_timeout_ms,
+                timeout=60_000,
             )
 
             try:
                 await page.wait_for_selector(
-                    wait_selector,
-                    timeout=selector_timeout_ms,
+                    "section",
+                    timeout=30_000,
                 )
             except PlaywrightTimeoutError:
                 logger.warning(
                     "Selector %r not found; waiting a fixed interval instead",
-                    wait_selector,
+                    "section",
                 )
                 await page.wait_for_timeout(5_000)
 
@@ -387,309 +426,324 @@ async def render_page(
             await browser.close()
 
 
-async def scrape_member_uuids(
-    url: str,
+async def render_index_page(
     session: str,
-    cookie_name: str = "session",
+    link_type: LinkType | str,
 ) -> list[str]:
-    """Render the page and return the member UUIDs found in its links."""
-    html = await render_page(url, session, cookie_name)
-    return extract_member_uuids(html)
+    """Render a page and return the IDs of the selected link type.
+
+    link_type selects which links are scraped:
+        "live"      -> href="/members/live/<id>"
+        "analysis"  -> href="/members/analysis/<id>"
+        "lessons"   -> href="/members/lessons/<id>"
+
+    Either a LinkType member or its string value is accepted. An invalid
+    value raises ValueError before the browser is launched.
+    """
+    link_type = LinkType(link_type)
+
+    html = await fetch_rendered_html(
+        _ID_URLS[link_type],
+        session,
+        ZXOLCR() + "session",
+
+    ids = extract_member_ids(html, link_type)
+    logger.info("Found %d unique '%s' link ID(s)", len(ids), link_type.value)
+    return ids
 
 
 ########################################################################################################
-############# SCRAPE SINGLE MENTORSHIP #################################################################
+############# SCRAPE SINGLE VIDEO
 ########################################################################################################
-
-async def render_page(args):
-    """
-    Render the supplied webpage with the session cookie
-    and extract the <mux-video> src.
-    """
-
-    page_url = args.url
-    session = args.session
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True
-        )
-
-        context = await browser.new_context(
-            viewport={
-                "width": 1920,
-                "height": 1080,
-            }
-        )
-
-        # Inject authentication/session cookie before loading the page.
-        parsed_url = urlparse(page_url)
-
-        await context.add_cookies([
-            {
-                "name": ZXOLCR() + "session",
-                "value": session,
-                "domain": parsed_url.hostname,
-                "path": "/",
-                "secure": parsed_url.scheme == "https",
-                "httpOnly": True,
-                "sameSite": "Lax",
-            }
-        ])
-
-        page = await context.new_page()
-
-        print(f"[+] Rendering: {page_url}")
-        print("[+] Injected session cookie")
-
-        await page.goto(
-            page_url,
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
-
-        try:
-            await page.wait_for_selector(
-                "mux-video",
-                timeout=30_000,
-            )
-        except PlaywrightTimeoutError:
-            await page.wait_for_timeout(5_000)
-
-        await page.wait_for_timeout(3_000)
-
-        await page.screenshot(
-            path=str(HLS_OUTPUT_DIR / "rendered.png"),
-            full_page=True,
-        )
-
-        html = await page.content()
-
-        (HLS_OUTPUT_DIR / "rendered.html").write_text(
-            html,
-            encoding="utf-8",
-        )
-
-        # -------------------------------------------------
-        # Extract Module number and Title
-        # -------------------------------------------------
-        module = None
-        title = None
-        date = None
-        filename = None
-
-        # Title from <h1> (shared by all modes)
-        try:
-            h1 = page.locator("header h1").first
-            title = (await h1.inner_text()).strip()
-        except Exception:
-            # Fallback: try any h1
-            try:
-                h1 = page.locator("h1").first
-                title = (await h1.inner_text()).strip()
-            except Exception:
-                title = None
-
-        if "/courses" in page_url:
-            # Module from the <p> that contains "Module N"
-            try:
-                header_p = page.locator("header p.text-\\[13px\\]").first
-                header_text = (await header_p.inner_text()).strip()
-
-                # Example: "Futures Mentorship · Module 1 · lesson 5 of 41"
-                match = re.search(r"Module\s+(\d+)", header_text, re.IGNORECASE)
-                if match:
-                    module = int(match.group(1))
-            except Exception:
-                # Fallback: search in the whole page content
-                match = re.search(r"Module\s+(\d+)", html, re.IGNORECASE)
-                if match:
-                    module = int(match.group(1))
-
-            if module is not None and title:
-                filename = sanitize_filename(f"{module} - {title}")
-
-            print(f"[+] Module   : {module}")
-            print(f"[+] Title    : {title}")
-
-        elif "/live" in page_url or "/analysis" in page_url:
-            # live:     "(*) 4/09/2026" -> "2026-09-04 - (*)"
-            # analysis: "(*) - 02-11-2026"            -> "2026-11-02 - (*)"
-            date, title = split_date_from_title(title)
-
-            # Live only: if the <h1> has no date, fall back to the <p> next to it
-            # e.g. <p>Recorded 4 September 2026.</p>
-            if "/live" in page_url and not date:
-                for selector in ("header h1 + p", "header p"):
-                    try:
-                        p = page.locator(selector).first
-                        p_text = (await p.inner_text()).strip()
-                    except Exception:
-                        continue
-
-                    date = parse_textual_date(p_text)
-                    if date:
-                        print("[+] Date source: <p> fallback")
-                        break
-
-            if date and title:
-                filename = sanitize_filename(f"{date} - {title}")
-
-            print(f"[+] Date     : {date}")
-            print(f"[+] Title    : {title}")
-
-        if filename:
-            print(f"[+] Filename : {filename}")
-        else:
-            print("[!] Could not build filename (missing module, date, or title)")
-
-        mux_videos = await page.locator("mux-video").all()
-
-        if not mux_videos:
-            await browser.close()
-            raise RuntimeError(
-                "No <mux-video> element was found."
-            )
-
-        print(f"[+] Found {len(mux_videos)} <mux-video> element(s)")
-
-        mux_video = mux_videos[0]
-
-        mux_data = await mux_video.evaluate(
-            """
-            (element) => {
-                const result = {
-                    attributes: {},
-                    properties: {}
-                };
-
-                for (const attr of element.attributes) {
-                    result.attributes[attr.name] = attr.value;
-                }
-
-                for (const property of [
-                    "src",
-                    "currentSrc",
-                    "playbackId"
-                ]) {
-                    try {
-                        result.properties[property] =
-                            element[property] ?? null;
-                    } catch (_) {
-                        result.properties[property] = null;
-                    }
-                }
-
-                return result;
-            }
-            """
-        )
-
-        await browser.close()
-
-        return (mux_data, filename)
-
-    """
-    Render the supplied webpage and extract the <mux-video> src.
-    """
-
-    async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(
-            headless=True
-        )
-
-        page = await browser.new_page(
-            viewport={
-                "width": 1920,
-                "height": 1080,
-            }
-        )
-
-        print(f"[+] Rendering: {page_url}")
-
-        await context.addCookies([
-            { name: 'sessionid', value: 'random', path: '/', domain: 'localhost' }
-        ]);
-
-        await page.goto(
-            page_url,
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
-
-        # Give client-side JavaScript some time to initialize Mux.
-        try:
-            await page.wait_for_selector(
-                "mux-video",
-                timeout=30_000,
-            )
-        except PlaywrightTimeoutError:
-            await page.wait_for_timeout(5_000)
-
-        # Allow JS/frameworks to finish assigning src.
-        await page.wait_for_timeout(3_000)
-
-        # Save rendered page for analysis.
-        await page.screenshot(
-            path=str(HLS_OUTPUT_DIR / "rendered.png"),
-            full_page=True,
-        )
-
-        html = await page.content()
-
-        (HLS_OUTPUT_DIR / "rendered.html").write_text(
-            html,
-            encoding="utf-8",
-        )
-
-        mux_videos = await page.locator("mux-video").all()
-
-        if not mux_videos:
-            await browser.close()
-            raise RuntimeError(
-                "No <mux-video> element was found."
-            )
-
-        print(f"[+] Found {len(mux_videos)} <mux-video> element(s)")
-
-        # Inspect the first mux-video.
-        mux_video = mux_videos[0]
-
-        mux_data = await mux_video.evaluate(
-            """
-            (element) => {
-                const result = {
-                    attributes: {},
-                    properties: {}
-                };
-
-                for (const attr of element.attributes) {
-                    result.attributes[attr.name] = attr.value;
-                }
-
-                // src can exist as a property even if it isn't
-                // visible as an HTML attribute.
-                for (const property of [
-                    "src",
-                    "currentSrc",
-                    "playbackId"
-                ]) {
-                    try {
-                        result.properties[property] =
-                            element[property] ?? null;
-                    } catch (_) {
-                        result.properties[property] = null;
-                    }
-                }
-
-                return result;
-            }
-            """
-        )
-
-        await browser.close()
-
-        return mux_data
+#
+# async def render_page(args):
+#     """
+#     Render the supplied webpage with the session cookie
+#     and extract the <mux-video> src.
+#     """
+#
+#     page_url = args.url
+#     session = args.session
+#
+#     async with async_playwright() as playwright:
+#         browser = await playwright.chromium.launch(
+#             headless=True
+#         )
+#
+#         context = await browser.new_context(
+#             viewport={
+#                 "width": 1920,
+#                 "height": 1080,
+#             }
+#         )
+#
+#         # Inject authentication/session cookie before loading the page.
+#         parsed_url = urlparse(page_url)
+#
+#         await context.add_cookies([
+#             {
+#                 "name": ZXOLCR() + "session",
+#                 "value": session,
+#                 "domain": parsed_url.hostname,
+#                 "path": "/",
+#                 "secure": parsed_url.scheme == "https",
+#                 "httpOnly": True,
+#                 "sameSite": "Lax",
+#             }
+#         ])
+#
+#         page = await context.new_page()
+#
+#         print(f"[+] Rendering: {page_url}")
+#         print("[+] Injected session cookie")
+#
+#         await page.goto(
+#             page_url,
+#             wait_until="domcontentloaded",
+#             timeout=60_000,
+#         )
+#
+#         try:
+#             await page.wait_for_selector(
+#                 "mux-video",
+#                 timeout=30_000,
+#             )
+#         except PlaywrightTimeoutError:
+#             await page.wait_for_timeout(5_000)
+#
+#         await page.wait_for_timeout(3_000)
+#
+#         await page.screenshot(
+#             path=str(HLS_OUTPUT_DIR / "rendered.png"),
+#             full_page=True,
+#         )
+#
+#         html = await page.content()
+#
+#         (HLS_OUTPUT_DIR / "rendered.html").write_text(
+#             html,
+#             encoding="utf-8",
+#         )
+#
+#         # -------------------------------------------------
+#         # Extract Module number and Title
+#         # -------------------------------------------------
+#         module = None
+#         title = None
+#         date = None
+#         filename = None
+#
+#         # Title from <h1> (shared by all modes)
+#         try:
+#             h1 = page.locator("header h1").first
+#             title = (await h1.inner_text()).strip()
+#         except Exception:
+#             # Fallback: try any h1
+#             try:
+#                 h1 = page.locator("h1").first
+#                 title = (await h1.inner_text()).strip()
+#             except Exception:
+#                 title = None
+#
+#         if "/courses" in page_url:
+#             # Module from the <p> that contains "Module N"
+#             try:
+#                 header_p = page.locator("header p.text-\\[13px\\]").first
+#                 header_text = (await header_p.inner_text()).strip()
+#
+#                 match = re.search(r"Module\s+(\d+)", header_text, re.IGNORECASE)
+#                 if match:
+#                     module = int(match.group(1))
+#             except Exception:
+#                 # Fallback: search in the whole page content
+#                 match = re.search(r"Module\s+(\d+)", html, re.IGNORECASE)
+#                 if match:
+#                     module = int(match.group(1))
+#
+#             if module is not None and title:
+#                 filename = sanitize_filename(f"{module} - {title}")
+#
+#             print(f"[+] Module   : {module}")
+#             print(f"[+] Title    : {title}")
+#
+#         elif "/live" in page_url or "/analysis" in page_url:
+#             # live:     "(*) 4/09/2026" -> "2026-09-04 - (*)"
+#             # analysis: "(*) - 02-11-2026"            -> "2026-11-02 - (*)"
+#             date, title = split_date_from_title(title)
+#
+#             # Live only: if the <h1> has no date, fall back to the <p> next to it
+#             # e.g. <p>Recorded 4 September 2026.</p>
+#             if "/live" in page_url and not date:
+#                 for selector in ("header h1 + p", "header p"):
+#                     try:
+#                         p = page.locator(selector).first
+#                         p_text = (await p.inner_text()).strip()
+#                     except Exception:
+#                         continue
+#
+#                     date = parse_textual_date(p_text)
+#                     if date:
+#                         print("[+] Date source: <p> fallback")
+#                         break
+#
+#             if date and title:
+#                 filename = sanitize_filename(f"{date} - {title}")
+#
+#             print(f"[+] Date     : {date}")
+#             print(f"[+] Title    : {title}")
+#
+#         if filename:
+#             print(f"[+] Filename : {filename}")
+#         else:
+#             print("[!] Could not build filename (missing module, date, or title)")
+#
+#         mux_videos = await page.locator("mux-video").all()
+#
+#         if not mux_videos:
+#             await browser.close()
+#             raise RuntimeError(
+#                 "No <mux-video> element was found."
+#             )
+#
+#         print(f"[+] Found {len(mux_videos)} <mux-video> element(s)")
+#
+#         mux_video = mux_videos[0]
+#
+#         mux_data = await mux_video.evaluate(
+#             """
+#             (element) => {
+#                 const result = {
+#                     attributes: {},
+#                     properties: {}
+#                 };
+#
+#                 for (const attr of element.attributes) {
+#                     result.attributes[attr.name] = attr.value;
+#                 }
+#
+#                 for (const property of [
+#                     "src",
+#                     "currentSrc",
+#                     "playbackId"
+#                 ]) {
+#                     try {
+#                         result.properties[property] =
+#                             element[property] ?? null;
+#                     } catch (_) {
+#                         result.properties[property] = null;
+#                     }
+#                 }
+#
+#                 return result;
+#             }
+#             """
+#         )
+#
+#         await browser.close()
+#
+#         return (mux_data, filename)
+#
+#     """
+#     Render the supplied webpage and extract the <mux-video> src.
+#     """
+#
+#     async with async_playwright() as playwright:
+#         browser = await playwright.chromium.launch(
+#             headless=True
+#         )
+#
+#         page = await browser.new_page(
+#             viewport={
+#                 "width": 1920,
+#                 "height": 1080,
+#             }
+#         )
+#
+#         print(f"[+] Rendering: {page_url}")
+#
+#         await context.addCookies([
+#             { name: 'sessionid', value: 'random', path: '/', domain: 'localhost' }
+#         ]);
+#
+#         await page.goto(
+#             page_url,
+#             wait_until="domcontentloaded",
+#             timeout=60_000,
+#         )
+#
+#         # Give client-side JavaScript some time to initialize Mux.
+#         try:
+#             await page.wait_for_selector(
+#                 "mux-video",
+#                 timeout=30_000,
+#             )
+#         except PlaywrightTimeoutError:
+#             await page.wait_for_timeout(5_000)
+#
+#         # Allow JS/frameworks to finish assigning src.
+#         await page.wait_for_timeout(3_000)
+#
+#         # Save rendered page for analysis.
+#         await page.screenshot(
+#             path=str(HLS_OUTPUT_DIR / "rendered.png"),
+#             full_page=True,
+#         )
+#
+#         html = await page.content()
+#
+#         (HLS_OUTPUT_DIR / "rendered.html").write_text(
+#             html,
+#             encoding="utf-8",
+#         )
+#
+#         mux_videos = await page.locator("mux-video").all()
+#
+#         if not mux_videos:
+#             await browser.close()
+#             raise RuntimeError(
+#                 "No <mux-video> element was found."
+#             )
+#
+#         print(f"[+] Found {len(mux_videos)} <mux-video> element(s)")
+#
+#         # Inspect the first mux-video.
+#         mux_video = mux_videos[0]
+#
+#         mux_data = await mux_video.evaluate(
+#             """
+#             (element) => {
+#                 const result = {
+#                     attributes: {},
+#                     properties: {}
+#                 };
+#
+#                 for (const attr of element.attributes) {
+#                     result.attributes[attr.name] = attr.value;
+#                 }
+#
+#                 // src can exist as a property even if it isn't
+#                 // visible as an HTML attribute.
+#                 for (const property of [
+#                     "src",
+#                     "currentSrc",
+#                     "playbackId"
+#                 ]) {
+#                     try {
+#                         result.properties[property] =
+#                             element[property] ?? null;
+#                     } catch (_) {
+#                         result.properties[property] = null;
+#                     }
+#                 }
+#
+#                 return result;
+#             }
+#             """
+#         )
+#
+#         await browser.close()
+#
+#         return mux_data
 
 
 async def download(url: str, client: httpx.AsyncClient) -> str:
@@ -812,167 +866,182 @@ async def main():
     )
 
     # ---------------------------------------------------------
+    # 0. Get UUIDs/segments of videos
+    # ---------------------------------------------------------
+
+    ids = await render_index_page(
+        session = args.session,
+        link_type = LinkType.LESSONS
+    )
+
+    for value in ids:
+        print(value)
+
+    # ---------------------------------------------------------
     # 1. Render page
     # ---------------------------------------------------------
 
-    (mux_data, output_filename) = await render_page(args)
 
-    print("\n[+] mux-video information:")
-
-    print("    Attributes:")
-    for key, value in mux_data["attributes"].items():
-        print_param(f"      {key} = {value}")
-
-    print("    Properties:")
-    for key, value in mux_data["properties"].items():
-        print_param(f"      {key} = {value}")
-
-    # Prefer currentSrc/src property, then HTML attribute.
-    mux_src = (
-        mux_data["properties"].get("src")
-        or mux_data["attributes"].get("src")
-    )
-
-    if not mux_src:
-        raise RuntimeError(
-            "Found <mux-video>, but could not determine its src."
-        )
-
-    # ---------------------------------------------------------
-    # 2. Determine playback_id / master M3U8
-    # ---------------------------------------------------------
-
-    # If src is relative, resolve it against the page URL.
-    master_url = urljoin(args.url, mux_src)
-
-    playback_id = playback_id_from_url(master_url)
-
-    print_param(f"\n[+] Mux video src: {master_url}")
-    print_param(f"[+] playback_id:   {playback_id}")
-
-    # ---------------------------------------------------------
-    # 3. Download master M3U8
-    # ---------------------------------------------------------
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/140.0 Safari/537.36"
-        ),
-        "Referer": args.url,
-    }
-
-    async with httpx.AsyncClient(headers=headers) as client:
-
-        master_manifest = await download(
-            master_url,
-            client,
-        )
-
-        master_path = HLS_OUTPUT_DIR / playback_id
-
-        master_path.write_text(
-            master_manifest,
-            encoding="utf-8",
-        )
-
-        print_param(f"[+] Saved master manifest: {master_path}")
-
-        # -----------------------------------------------------
-        # 4. Find 1920x1080 video manifest
-        # -----------------------------------------------------
-
-        video_url = find_video_variant(
-            master_manifest,
-            master_url,
-        )
-
-        print_param(f"[+] 1080p video URL: {video_url}")
-
-        video_manifest = await download(
-            video_url,
-            client,
-        )
-
-        # video_path = HLS_OUTPUT_DIR / "video.m3u8"
-        #
-        # video_path.write_text(
-        #     video_manifest,
-        #     encoding="utf-8",
-        # )
-        #
-        # print(f"[+] Saved: {video_path}")
-
-        # -----------------------------------------------------
-        # 5. Extract PSSH
-        # -----------------------------------------------------
-
-        pssh = ""
-        is_enc = True
-
-        try:
-            pssh = extract_pssh(video_manifest)
-        except Exception as exc:
-            is_enc = False
-
-        # (HLS_OUTPUT_DIR / "pssh.txt").write_text(
-        #     pssh,
-        #     encoding="ascii",
-        # )
-
-        if is_enc:
-            print(f"[+] PSSH: {pssh}")
-        else:
-            print(f"[-] No PSSH found")
-        # print(f"[+] Saved PSSH: {HLS_OUTPUT_DIR / 'pssh.txt'}")
-
-        # -----------------------------------------------------
-        # 6. Find audio manifest
-        # -----------------------------------------------------
-
-        audio_url = find_audio_variant(
-            master_manifest,
-            master_url,
-        )
-
-        print_param(f"[+] Audio URL: {audio_url}")
-
-        # audio_manifest = await download(
-        #     audio_url,
-        #     client,
-        # )
-        #
-        # audio_path = HLS_OUTPUT_DIR / "audio.m3u8"
-        #
-        # audio_path.write_text(
-        #     audio_manifest,
-        #     encoding="utf-8",
-        # )
-        #
-        # print(f"[+] Saved: {audio_path}")
-
-        # -----------------------------------------------------
-        # 6. Find subtitles
-        # -----------------------------------------------------
-
-        try:
-            subs_url = extract_subtitle_url(master_manifest)
-            download_m3u8(subs_url, f"{output_filename}.vtt")
-        except Exception as exc:
-            print("[-] No subs")
-
-    if not args.only_subs:
-        if is_enc:
-            content_key = get_key(pssh, "device.wvd", playback_id, mux_data["attributes"]["drm-token"])
-            download_m3u8(video_url, f"{HLS_OUTPUT_DIR}/video.enc.tmp")
-            decrypt_mp4(Path(HLS_OUTPUT_DIR, "video.enc.tmp"), Path(HLS_OUTPUT_DIR, "video.tmp"), content_key)
-
-        else:
-            download_m3u8(video_url, f"{HLS_OUTPUT_DIR}/video.tmp")
-
-        download_m3u8(audio_url, f"{HLS_OUTPUT_DIR}/audio.tmp")
-        mux_video_audio(Path(HLS_OUTPUT_DIR, "video.tmp"), Path(HLS_OUTPUT_DIR, "audio.tmp"), f"{OUTPUT_DIR}/{output_filename}.mp4")
+    #
+    # (mux_data, output_filename) = await render_page(args)
+    #
+    # print("\n[+] mux-video information:")
+    #
+    # print("    Attributes:")
+    # for key, value in mux_data["attributes"].items():
+    #     print_param(f"      {key} = {value}")
+    #
+    # print("    Properties:")
+    # for key, value in mux_data["properties"].items():
+    #     print_param(f"      {key} = {value}")
+    #
+    # # Prefer currentSrc/src property, then HTML attribute.
+    # mux_src = (
+    #     mux_data["properties"].get("src")
+    #     or mux_data["attributes"].get("src")
+    # )
+    #
+    # if not mux_src:
+    #     raise RuntimeError(
+    #         "Found <mux-video>, but could not determine its src."
+    #     )
+    #
+    # # ---------------------------------------------------------
+    # # 2. Determine playback_id / master M3U8
+    # # ---------------------------------------------------------
+    #
+    # # If src is relative, resolve it against the page URL.
+    # master_url = urljoin(args.url, mux_src)
+    #
+    # playback_id = playback_id_from_url(master_url)
+    #
+    # print_param(f"\n[+] Mux video src: {master_url}")
+    # print_param(f"[+] playback_id:   {playback_id}")
+    #
+    # # ---------------------------------------------------------
+    # # 3. Download master M3U8
+    # # ---------------------------------------------------------
+    #
+    # headers = {
+    #     "User-Agent": (
+    #         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    #         "AppleWebKit/537.36 (KHTML, like Gecko) "
+    #         "Chrome/140.0 Safari/537.36"
+    #     ),
+    #     "Referer": args.url,
+    # }
+    #
+    # async with httpx.AsyncClient(headers=headers) as client:
+    #
+    #     master_manifest = await download(
+    #         master_url,
+    #         client,
+    #     )
+    #
+    #     master_path = HLS_OUTPUT_DIR / playback_id
+    #
+    #     master_path.write_text(
+    #         master_manifest,
+    #         encoding="utf-8",
+    #     )
+    #
+    #     print_param(f"[+] Saved master manifest: {master_path}")
+    #
+    #     # -----------------------------------------------------
+    #     # 4. Find 1920x1080 video manifest
+    #     # -----------------------------------------------------
+    #
+    #     video_url = find_video_variant(
+    #         master_manifest,
+    #         master_url,
+    #     )
+    #
+    #     print_param(f"[+] 1080p video URL: {video_url}")
+    #
+    #     video_manifest = await download(
+    #         video_url,
+    #         client,
+    #     )
+    #
+    #     # video_path = HLS_OUTPUT_DIR / "video.m3u8"
+    #     #
+    #     # video_path.write_text(
+    #     #     video_manifest,
+    #     #     encoding="utf-8",
+    #     # )
+    #     #
+    #     # print(f"[+] Saved: {video_path}")
+    #
+    #     # -----------------------------------------------------
+    #     # 5. Extract PSSH
+    #     # -----------------------------------------------------
+    #
+    #     pssh = ""
+    #     is_enc = True
+    #
+    #     try:
+    #         pssh = extract_pssh(video_manifest)
+    #     except Exception as exc:
+    #         is_enc = False
+    #
+    #     # (HLS_OUTPUT_DIR / "pssh.txt").write_text(
+    #     #     pssh,
+    #     #     encoding="ascii",
+    #     # )
+    #
+    #     if is_enc:
+    #         print(f"[+] PSSH: {pssh}")
+    #     else:
+    #         print(f"[-] No PSSH found")
+    #     # print(f"[+] Saved PSSH: {HLS_OUTPUT_DIR / 'pssh.txt'}")
+    #
+    #     # -----------------------------------------------------
+    #     # 6. Find audio manifest
+    #     # -----------------------------------------------------
+    #
+    #     audio_url = find_audio_variant(
+    #         master_manifest,
+    #         master_url,
+    #     )
+    #
+    #     print_param(f"[+] Audio URL: {audio_url}")
+    #
+    #     # audio_manifest = await download(
+    #     #     audio_url,
+    #     #     client,
+    #     # )
+    #     #
+    #     # audio_path = HLS_OUTPUT_DIR / "audio.m3u8"
+    #     #
+    #     # audio_path.write_text(
+    #     #     audio_manifest,
+    #     #     encoding="utf-8",
+    #     # )
+    #     #
+    #     # print(f"[+] Saved: {audio_path}")
+    #
+    #     # -----------------------------------------------------
+    #     # 6. Find subtitles
+    #     # -----------------------------------------------------
+    #
+    #     try:
+    #         subs_url = extract_subtitle_url(master_manifest)
+    #         download_m3u8(subs_url, f"{output_filename}.vtt")
+    #     except Exception as exc:
+    #         print("[-] No subs")
+    #
+    # if not args.only_subs:
+    #     if is_enc:
+    #         content_key = get_key(pssh, "device.wvd", playback_id, mux_data["attributes"]["drm-token"])
+    #         download_m3u8(video_url, f"{HLS_OUTPUT_DIR}/video.enc.tmp")
+    #         decrypt_mp4(Path(HLS_OUTPUT_DIR, "video.enc.tmp"), Path(HLS_OUTPUT_DIR, "video.tmp"), content_key)
+    #
+    #     else:
+    #         download_m3u8(video_url, f"{HLS_OUTPUT_DIR}/video.tmp")
+    #
+    #     download_m3u8(audio_url, f"{HLS_OUTPUT_DIR}/audio.tmp")
+    #     mux_video_audio(Path(HLS_OUTPUT_DIR, "video.tmp"), Path(HLS_OUTPUT_DIR, "audio.tmp"), f"{OUTPUT_DIR}/{output_filename}.mp4")
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     asyncio.run(main())
